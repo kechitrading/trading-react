@@ -1,0 +1,191 @@
+name: Deploy
+
+# Continuous deployment of the dashboard to the AQTA host (same EC2 server and nginx as the API).
+#
+# - Every push to main deploys once CI has passed on that commit.
+# - NFR-015: no deploys 08:30-23:45 IST on weekdays. A merge inside that window is skipped with a
+#   notice and picked up by the nightly run at 23:50 IST.
+# - Manual runs (deploy / rollback) can override the window only with force=true and a reason.
+# - Rollback: automatic on a failed health check (deploy/release.sh), or the rollback action.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '25 18 * * 1-5' # 23:55 IST Mon-Fri, after the aqta API's 23:50 run
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'deploy or rollback'
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      sha:
+        description: 'rollback only: release to switch to (defaults to the previous one)'
+        required: false
+        default: ''
+      force:
+        description: 'Override the 08:30-23:45 IST weekday freeze (logged as a warning)'
+        type: boolean
+        default: false
+      reason:
+        description: 'Why (required when force=true)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-webapp-production
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Decide whether to deploy (CI status + IST freeze)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    outputs:
+      proceed: ${{ steps.window.outputs.proceed }}
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Resolve commit to deploy
+        id: sha
+        env:
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: echo "sha=${RUN_SHA:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check CI passed for this commit (scheduled and manual runs)
+        if: github.event_name != 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          ACTION: ${{ inputs.action || 'deploy' }}
+        run: |
+          if [ "$ACTION" = "rollback" ]; then exit 0; fi
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&status=success" --jq '.total_count')
+          if [ "${status:-0}" -lt 1 ]; then
+            echo "::error::No successful CI run for ${SHA}; refusing to deploy."
+            exit 1
+          fi
+
+      - name: Trading-hours freeze (IST)
+        id: window
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force || 'false' }}
+          REASON: ${{ inputs.reason }}
+          DEPLOY_CONFIGURED: ${{ secrets.DEPLOY_HOST != '' }}
+        run: |
+          if [ "$DEPLOY_CONFIGURED" != "true" ]; then
+            echo "::notice::DEPLOY_HOST secret not set yet: skipping deploy (see README, Deployment)."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dow=$(TZ=Asia/Kolkata date +%u)            # 1=Mon .. 7=Sun
+          hm=$((10#$(TZ=Asia/Kolkata date +%H%M)))   # e.g. 0830 -> 830
+          echo "IST now: $(TZ=Asia/Kolkata date '+%a %F %H:%M')"
+          # Exchange holidays are treated as trading days (conservative).
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 830 ] && [ "$hm" -le 2345 ]; then
+            if [ "$EVENT" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+              if [ -z "$REASON" ]; then echo "::error::force=true requires a reason"; exit 1; fi
+              echo "::warning::FORCED deploy inside the trading window by ${GITHUB_ACTOR}: ${REASON} (NFR-015)"
+            elif [ "$EVENT" = "workflow_dispatch" ]; then
+              echo "::error::Deploys are blocked 08:30-23:45 IST on weekdays (NFR-015). Use force=true with a reason only in an emergency."
+              exit 1
+            else
+              echo "::notice::Inside the trading window: deploy deferred to the 23:55 IST nightly run (NFR-015)."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build dashboard
+    needs: guard
+    if: >-
+      needs.guard.outputs.proceed == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.action == 'deploy')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package
+        run: tar -czf webapp.tgz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webapp-${{ needs.guard.outputs.sha }}
+          path: |
+            webapp.tgz
+            deploy/release.sh
+          retention-days: 30
+
+  deploy:
+    name: Deploy to AWS (Mumbai)
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    environment: production # optional: add required reviewers to approve each deploy
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: webapp-${{ needs.guard.outputs.sha }}
+
+      - name: Copy build to the host
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: webapp.tgz,deploy/release.sh
+          target: /tmp/aqta-webapp-${{ needs.guard.outputs.sha }}
+
+      - name: Release
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            DIR=/tmp/aqta-webapp-${{ needs.guard.outputs.sha }}
+            trap 'rm -rf "$DIR"' EXIT
+            install -m 0750 "$DIR/deploy/release.sh" /var/www/aqta-webapp/release.sh
+            /var/www/aqta-webapp/release.sh deploy ${{ needs.guard.outputs.sha }} "$DIR/webapp.tgz"
+
+  rollback:
+    name: Roll back dashboard
+    needs: guard
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.action == 'rollback' &&
+      needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - uses: appleboy/ssh-action@v1
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: TARGET_SHA
+          script: |
+            set -e
+            case "$TARGET_SHA" in ""|[0-9a-f]*) ;; *) echo "bad sha"; exit 1 ;; esac
+            /var/www/aqta-webapp/release.sh rollback $TARGET_SHA

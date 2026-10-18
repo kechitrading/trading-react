@@ -56,7 +56,35 @@ Open http://localhost:5173 and sign in with the backend `API_TOKEN`. The dev ser
 
 ## Deployment
 
-Served by the aqta nginx on the AWS host, same origin as the API, so no CORS is needed. Build with
-`npm run build`, copy `dist/` to `/opt/aqta/webapp`, and use
-[`deploy/nginx-webapp.conf.example`](deploy/nginx-webapp.conf.example). Do not deploy during
-trading hours (NFR-015: no deploys 08:30 to 23:45 IST on trading days).
+The dashboard runs on the same EC2 host as the aqta API, served by the same nginx site at
+`https://<ELASTIC_IP>/`, with `/api`, `/health`, `/ready` and `/docs` going to the API. Same
+origin, so no CORS. The nginx site comes from aqta `deploy/scripts/setup-nginx-ip.sh`.
+
+**Merging to `main` deploys automatically.** When CI passes on a push to `main`,
+`.github/workflows/deploy.yml` builds `dist/`, copies it to the host over SSH and runs
+[`deploy/release.sh`](deploy/release.sh), which:
+
+- unpacks the build into `/var/www/aqta-webapp/releases/<sha>`,
+- switches `/var/www/aqta-webapp/current` to it with an atomic symlink rename,
+- checks the page and its JS through nginx, and switches back if that fails,
+- keeps the 5 newest builds for rollback.
+
+| Trigger                        | Inside 08:30-23:45 IST, Mon-Fri                          | Outside that window   |
+| ------------------------------ | -------------------------------------------------------- | --------------------- |
+| CI green on `main`             | skipped with a notice; the 23:55 IST nightly run deploys | deploys               |
+| Nightly 23:55 IST (Mon-Fri)    | n/a                                                      | deploys `main`'s head |
+| Manual run (Actions -> Deploy) | fails, unless `force=true` with a reason                 | deploys or rolls back |
+
+Nothing deploys while the `DEPLOY_HOST` secret is unset.
+
+### One-time setup
+
+1. In this repo: **Settings -> Secrets and variables -> Actions**, add the same three secrets the
+   aqta repo uses: `DEPLOY_HOST` (Elastic IP), `DEPLOY_USER` (`ubuntu`) and `DEPLOY_SSH_KEY` (the
+   private deploy key). Optionally create a `production` environment with yourself as reviewer.
+2. On the server, re-run the nginx script from the aqta repo once, so it serves the dashboard:
+   `bash setup-nginx-ip.sh <ELASTIC_IP>`.
+3. Actions -> **Deploy** -> Run workflow (outside trading hours).
+
+Rollback: Actions -> Deploy -> action `rollback` (optionally a `sha`), or on the server
+`/var/www/aqta-webapp/release.sh rollback`.
